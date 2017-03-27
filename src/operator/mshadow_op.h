@@ -442,7 +442,10 @@ struct sign {
 struct sign_grad {
   template<typename DType>
   MSHADOW_XINLINE static DType Map(DType a) {
-    return DType(DType(0.0f));
+    if (a >= 1.0f || a <= -1.0f)
+      return DType(DType(0.0f));
+    else
+      return DType(a);
   }
 };
 /*! \brief used for generate element of power */
