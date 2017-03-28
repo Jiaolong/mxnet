@@ -103,8 +103,9 @@ class BinaryConvolutionOp : public Operator {
     AllocSpace(&wmat);
     wmat = F<mshadow_op::sign>(wmat_real);
     // compute alpha
-    index_t num_elements = param_.kernel[0] * param_.kernel[1];
+    index_t num_elements = wmat_shape[2];
     alpha_.resize(param_.num_filter);
+    CHECK_EQ(alpha_.size(), wmat.size(1));
     
     for (index_t j = 0; j < wmat.size(1); j++) {
         alpha_[j] = 0.0;
@@ -161,9 +162,11 @@ class BinaryConvolutionOp : public Operator {
                                                   out.size(2),
                                                   out.size(3))));
     }
-    
-    for (uint32_t i = 0; i < alpha_.size(); i++)
-        out[i] *= alpha_[i];
+   
+    CHECK_EQ(alpha_.size(), out.size(1));
+    for (uint32_t i = 0; i < out.size(0); i++)
+        for (uint32_t j = 0; j < out.size(1); j++)
+            out[i][j] *= alpha_[j];
     
     FreeSpace(&wmat);
   }
