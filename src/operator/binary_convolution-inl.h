@@ -103,13 +103,17 @@ class BinaryConvolutionOp : public Operator {
     AllocSpace(&wmat);
     wmat = F<mshadow_op::sign>(wmat_real);
     // compute alpha
-    alpha_ = 0.0;
-    index_t num_elements = wmat_shape[0] * wmat_shape[1] * wmat_shape[2];
-    for (index_t i = 0; i < wmat.size(0); i++)
-        for (index_t j = 0; j < wmat.size(1); j++)
+    index_t num_elements = param_.kernel[0] * param_.kernel[1];
+    alpha_.resize(param_.num_filter);
+    
+    for (index_t j = 0; j < wmat.size(1); j++) {
+        alpha_[j] = 0.0;
+        for (index_t i = 0; i < wmat.size(0); i++)
             for (index_t k = 0; k < wmat.size(2); k++)
-                alpha_ += fabsf(float(wmat_real[i][j][k]));
-    alpha_ /= num_elements;
+                alpha_[j] += fabsf(float(wmat_real[i][j][k]));
+        
+        alpha_[j] /= num_elements;
+    }
  
     Tensor<xpu, 4, DType> out = out_data[conv::kOut].get<xpu, 4, DType>(s);
     const index_t nbatch = data.size(0);
@@ -157,7 +161,10 @@ class BinaryConvolutionOp : public Operator {
                                                   out.size(2),
                                                   out.size(3))));
     }
-    out *= alpha_;
+    
+    for (uint32_t i = 0; i < alpha_.size(); i++)
+        out[i] *= alpha_[i];
+    
     FreeSpace(&wmat);
   }
 
@@ -265,7 +272,7 @@ class BinaryConvolutionOp : public Operator {
       }
     }
     // update gradient
-    float ee = 1.0 / (wmat_shape[0] * wmat_shape[1] * wmat_shape[2]);
+    float ee = 1.0 / (wmat_shape[2]);
     
     for (index_t i = 0; i < wmat.size(0); i++)
         for (index_t j = 0; j < wmat.size(1); j++)
@@ -273,7 +280,7 @@ class BinaryConvolutionOp : public Operator {
                 if (wmat[i][j][k] >= 1 || wmat[i][j][k] <= -1)
                     gwmat[i][j][k] *= ee;
                 else
-                    gwmat[i][j][k] *= (alpha_ * wmat[i][j][k] + ee);
+                    gwmat[i][j][k] *= (alpha_[j] * wmat[i][j][k] + ee);
   }
 
  private:
@@ -311,7 +318,7 @@ class BinaryConvolutionOp : public Operator {
   mshadow::Shape<2> shape_colunit_;
   mshadow::Shape<3> shape_dstunit_;
   index_t nstep_;
-  float alpha_;
+  std::vector<float> alpha_;
 };  // class BinaryConvolutionOp
 
 template<typename xpu>
