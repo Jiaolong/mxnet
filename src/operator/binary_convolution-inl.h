@@ -98,24 +98,29 @@ class BinaryConvolutionOp : public Operator {
     Tensor<xpu, 3, DType> wmat_real =
         in_data[conv::kWeight].get_with_shape<xpu, 3, DType>(wmat_shape, s);
     
+    // compute alpha
+    index_t num_elements = wmat_shape[2];
+    alpha_.resize(param_.num_filter);
+    CHECK_EQ(alpha_.size(), wmat_real.size(1));
+    
+    for (index_t i = 0; i < wmat_real.size(0); i++) {
+        for (index_t j = 0; j < wmat_real.size(1); j++) {
+            alpha_[j] = 0.0;
+            for (index_t k = 0; k < wmat_real.size(2); k++) {
+              alpha_[j] += fabsf(float(wmat_real[i][j][k]));
+            }
+            alpha_[j] /= num_elements;
+        }
+    }
+ 
     // binarilize weight
     Tensor<xpu, 3, DType> wmat(wmat_shape);
     AllocSpace(&wmat);
     wmat = F<mshadow_op::sign>(wmat_real);
-    // compute alpha
-    index_t num_elements = wmat_shape[2];
-    alpha_.resize(param_.num_filter);
-    CHECK_EQ(alpha_.size(), wmat.size(1));
-    
-    for (index_t j = 0; j < wmat.size(1); j++) {
-        alpha_[j] = 0.0;
-        for (index_t i = 0; i < wmat.size(0); i++)
-            for (index_t k = 0; k < wmat.size(2); k++)
-                alpha_[j] += fabsf(float(wmat_real[i][j][k]));
-        
-        alpha_[j] /= num_elements;
-    }
- 
+    for (index_t i = 0; i < wmat.size(0); i++)
+        for (index_t j = 0; j < wmat.size(1); j++)
+            wmat[i][j] *= alpha_[j];
+
     Tensor<xpu, 4, DType> out = out_data[conv::kOut].get<xpu, 4, DType>(s);
     const index_t nbatch = data.size(0);
     Tensor<xpu, 1, DType> workspace =
@@ -162,12 +167,7 @@ class BinaryConvolutionOp : public Operator {
                                                   out.size(2),
                                                   out.size(3))));
     }
-   
-    CHECK_EQ(alpha_.size(), out.size(1));
-    for (uint32_t i = 0; i < out.size(0); i++)
-        for (uint32_t j = 0; j < out.size(1); j++)
-            out[i][j] *= alpha_[j];
-    
+    // free space  
     FreeSpace(&wmat);
   }
 
@@ -195,7 +195,7 @@ class BinaryConvolutionOp : public Operator {
         Shape3(param_.num_group,
                param_.num_filter / param_.num_group,
                data.shape_[1] / param_.num_group * param_.kernel[0] * param_.kernel[1]);
-    Tensor<xpu, 3, DType> wmat =
+    Tensor<xpu, 3, DType> wmat_real =
         in_data[conv::kWeight].get_with_shape<xpu, 3, DType>(wmat_shape, s);
     Tensor<xpu, 4, DType> grad = out_grad[conv::kOut].get<xpu, 4, DType>(s);
     Tensor<xpu, 4, DType> gdata = in_grad[conv::kData].get<xpu, 4, DType>(s);
@@ -205,6 +205,15 @@ class BinaryConvolutionOp : public Operator {
     Tensor<xpu, 1, DType> workspace =
         ctx.requested[conv::kTempSpace].get_space_typed<xpu, 1, DType>(
             Shape1(this->InitTemp(data.shape_, grad.shape_)), s);
+    
+    // binarilize weight
+    Tensor<xpu, 3, DType> wmat(wmat_shape);
+    AllocSpace(&wmat);
+    wmat = F<mshadow_op::sign>(wmat_real);
+    for (index_t i = 0; i < wmat.size(0); i++)
+        for (index_t j = 0; j < wmat.size(1); j++)
+            wmat[i][j] *= alpha_[j];
+
     for (index_t i = 0; i < nbatch; i += nstep_) {
       const index_t step = std::min(nstep_, nbatch - i);
       Tensor<xpu, 2, DType> temp_col = Tensor<xpu, 2, DType>(workspace.dptr_,
@@ -277,13 +286,15 @@ class BinaryConvolutionOp : public Operator {
     // update gradient
     float ee = 1.0 / (wmat_shape[2]);
     
-    for (index_t i = 0; i < wmat.size(0); i++)
-        for (index_t j = 0; j < wmat.size(1); j++)
-            for (index_t k = 0; k < wmat.size(2); k++)
-                if (wmat[i][j][k] >= 1 || wmat[i][j][k] <= -1)
+    for (index_t i = 0; i < wmat_real.size(0); i++)
+        for (index_t j = 0; j < wmat_real.size(1); j++)
+            for (index_t k = 0; k < wmat_real.size(2); k++)
+                if (wmat_real[i][j][k] >= 1 || wmat_real[i][j][k] <= -1)
                     gwmat[i][j][k] *= ee;
                 else
-                    gwmat[i][j][k] *= (alpha_[j] * wmat[i][j][k] + ee);
+                    gwmat[i][j][k] *= (alpha_[j] * wmat_real[i][j][k] + ee);
+    // free space  
+    FreeSpace(&wmat);
   }
 
  private:
