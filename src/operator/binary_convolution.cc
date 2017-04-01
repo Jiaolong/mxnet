@@ -9,6 +9,7 @@
 
 namespace mxnet {
 namespace op {
+
 DMLC_REGISTER_PARAMETER(BinaryConvolutionParam);
 
 template<>
