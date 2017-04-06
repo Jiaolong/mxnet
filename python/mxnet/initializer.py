@@ -92,6 +92,8 @@ class Initializer(object):
                 self._init_gamma(desc, arr)
             elif desc.endswith('beta'):
                 self._init_beta(desc, arr)
+            elif desc.endswith('alpha'):
+                self._init_one(desc, arr)
             else:
                 self._init_default(desc, arr)
 
