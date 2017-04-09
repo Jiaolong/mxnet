@@ -39,6 +39,7 @@ struct BinaryConvolutionParam : public dmlc::Parameter<BinaryConvolutionParam> {
   TShape pad;
   uint32_t num_group;
   uint32_t num_filter;
+  uint64_t workspace;
   bool xnor_net;
   dmlc::optional<int> layout;
   DMLC_DECLARE_PARAMETER(BinaryConvolutionParam) {
@@ -55,6 +56,8 @@ struct BinaryConvolutionParam : public dmlc::Parameter<BinaryConvolutionParam> {
     .describe("wether or not xnor network.");
     DMLC_DECLARE_FIELD(num_filter).set_range(1, 100000)
     .describe("convolution filter(channel) number");
+    DMLC_DECLARE_FIELD(workspace).set_default(1024).set_range(0, 8192)
+    .describe("Maximum temperal workspace allowed for convolution (MB).");
     DMLC_DECLARE_FIELD(layout)
     .add_enum("NCHW", mshadow::kNCHW)
     .add_enum("NHWC", mshadow::kNHWC)
@@ -71,6 +74,8 @@ class BinaryConvolutionOp : public Operator {
  public:
   explicit BinaryConvolutionOp(BinaryConvolutionParam p) {
     this->param_ = p;
+    // convert MBytes first to Bytes and then to elements.
+    param_.workspace = (param_.workspace << 20) / sizeof(DType);
     CHECK(param_.layout.value() == mshadow::kNCHW) 
         << "Only support NCHW layout";
   }
@@ -87,69 +92,64 @@ class BinaryConvolutionOp : public Operator {
     Stream<xpu> *s = ctx.get_stream<xpu>();
     Tensor<xpu, 4, DType> data  = in_data[conv::kData].get<xpu, 4, DType>(s);
     Tensor<xpu, 4, DType> out   = out_data[conv::kOut].get<xpu, 4, DType>(s);
-    const size_t nbatch  = data.shape_[0];
-    const size_t input_c = data.shape_[1];
-    const size_t input_h = data.shape_[2];
-    const size_t input_w = data.shape_[3];
-    const size_t f_n = param_.num_filter;
-    const size_t f_h = param_.kernel[0];
-    const size_t f_w = param_.kernel[1];
-    const size_t out_h = out.shape_[2];
-    const size_t out_w = out.shape_[3];
+    Tensor<xpu, 1, DType> alpha = aux_args[conv::kAlpha].get<xpu, 1, DType>(s);
+
+    const index_t nbatch  = data.shape_[0];
+    const index_t input_c = data.shape_[1];
+    const index_t input_h = data.shape_[2];
+    const index_t input_w = data.shape_[3];
+    const index_t f_n = param_.num_filter;
+    const index_t f_h = param_.kernel[0];
+    const index_t f_w = param_.kernel[1];
+    const index_t out_h = out.shape_[2];
+    const index_t out_w = out.shape_[3];
 
     Shape<2> w_shape = Shape2(f_n, input_c * f_h * f_w);
+    Tensor<xpu, 2, DType> w_real =
+        in_data[conv::kWeight].get_with_shape<xpu, 2, DType>(w_shape, s);
     // length of encoded array
     int len_encode = w_shape[1] / 32 + (w_shape[1] % 32 == 0 ? 0 : 1); 
+    index_t temp_size = this->InitTemp(data.shape_, out.shape_);
 
-    Tensor<xpu, 1, DType> alpha = aux_args[conv::kAlpha].get<xpu, 1, DType>(s);
+    // encoded binary weight
     Tensor<xpu, 2, DType> w_bin;
     if (param_.xnor_net) {
         w_bin = aux_args[conv::kBinWeight].get<xpu, 2, DType>(s);
-        CHECK_EQ(w_bin.shape_[0], f_n) << "binary weight shape[0]";
-        CHECK_EQ(w_bin.shape_[1], len_encode) << "binary weight shape[1]";
-    }
-
-    Tensor<xpu, 2, DType> w_real =
-        in_data[conv::kWeight].get_with_shape<xpu, 2, DType>(w_shape, s);
-     
-    // compute alpha 
-    for (index_t j = 0; j < w_real.size(0); j++) {
-        alpha[j] = 0.0;
-        for (index_t k = 0; k < w_real.size(1); k++)
-          alpha[j] += fabsf(float(w_real[j][k]));
+        // encode weight [m, n] -> [m, n/32]
+        if (ctx.is_train) {
+            binary_op::encode_cols((float*) w_real.dptr_, (unsigned int*) w_bin.dptr_,
+                   w_real.size(0), w_real.size(1));
+        }
         
-        alpha[j] /= w_shape[1];
+        temp_size += len_encode * out_w * out_h * nstep_;
+    }
+ 
+    // compute alpha 
+    if (ctx.is_train) {
+        for (index_t j = 0; j < w_real.size(0); j++) {
+            alpha[j] = 0.0;
+            for (index_t k = 0; k < w_real.size(1); k++)
+              alpha[j] += fabsf(float(w_real[j][k]));
+            
+            alpha[j] /= w_shape[1];
+        }
     }
      
-    int temp_size = w_shape[1] * out_h * out_w + f_n * out_h * out_w;
-    if (param_.xnor_net)
-        temp_size += len_encode * out_w * out_h;
-    
     Tensor<xpu, 1, DType> workspace 
         = ctx.requested[conv::kTempSpace].get_space_typed<xpu, 1, DType>(
                 Shape1(temp_size), s);
-
-    // storage of image to column data
-    Tensor<xpu, 2, DType> temp_col = Tensor<xpu, 2, DType>(
-            workspace.dptr_, Shape2(w_shape[1], out_h * out_w), s);
-    // storage of dot product result of a path and filter
-    Tensor<xpu, 2, DType> temp_dst = Tensor<xpu, 2, DType>(
-            workspace.dptr_ + temp_col.shape_.Size(), Shape2(f_n, out_h * out_w), s);
-
-    Tensor<xpu, 2, DType> temp_col_bin; 
-    if (param_.xnor_net) { 
-        // storage of encoded binary data
-        temp_col_bin = Tensor<xpu, 2, DType>(
-                workspace.dptr_ + temp_col.shape_.Size() + temp_dst.shape_.Size(),
-                Shape2(len_encode, out_h * out_w), s);
-       
-        // encode weight [m, n] -> [m, n/32]
-        binary_op::encode_cols((float*) w_real.dptr_, (unsigned int*) w_bin.dptr_,
-               w_real.size(0), w_real.size(1));
-    }
+ 
+    for (index_t i = 0; i < nbatch; i += nstep_) {
+      const index_t step = std::min(nstep_, nbatch - i);
+      // storage of image to column data, [f_n * f_h * f_w, out_h * out_w * step]
+      Tensor<xpu, 2, DType> temp_col = Tensor<xpu, 2, DType>(
+            workspace.dptr_, Shape2(w_shape[1], out_h * out_w * step), s);
     
-    const index_t step = 1;
-    for (index_t i = 0; i < nbatch; i += step) {
+      // storage of dot product result of a path and filter
+      Tensor<xpu, 2, DType> temp_dst = Tensor<xpu, 2, DType>(
+            workspace.dptr_ + temp_col.shape_.Size(), Shape2(f_n, out_h * out_w * step), s);
+
+
       if (param_.pad[0] == 0 && param_.pad[1] == 0) {
         temp_col = unpack_patch2col(data.Slice(i, i + step),
                                     param_.kernel[0],
@@ -170,14 +170,18 @@ class BinaryConvolutionOp : public Operator {
       }
 
       if (param_.xnor_net) {
-          // encode rows [n, k] -> [n/32, k]
-          binary_op::encode_rows((float*) temp_col.dptr_, (unsigned int*) temp_col_bin.dptr_,
-                  temp_col.size(0), temp_col.size(1));
+        // temporary memory of encoded binary data
+        Tensor<xpu, 2, DType> temp_col_bin = Tensor<xpu, 2, DType>(
+                workspace.dptr_ + temp_col.shape_.Size() + temp_dst.shape_.Size(),
+                Shape2(len_encode, out_h * out_w * step), s);
+        // encode rows [n, k] -> [n/32, k]
+        binary_op::encode_rows((float*) temp_col.dptr_, (unsigned int*) temp_col_bin.dptr_,
+                temp_col.size(0), temp_col.size(1));
 
-          binary_op::popcount_xnor_dot((unsigned int*) w_bin.dptr_,
-                  (unsigned int*) temp_col_bin.dptr_,
-                  w_real.size(0), w_real.size(1), temp_col.size(1),
-                  (float*)temp_dst.dptr_, (float*)alpha.dptr_);
+        binary_op::popcount_xnor_dot((unsigned int*) w_bin.dptr_,
+                (unsigned int*) temp_col_bin.dptr_,
+                w_real.size(0), w_real.size(1), temp_col.size(1),
+                (float*)temp_dst.dptr_, (float*)alpha.dptr_);
       } else {
           // dot product
           binary_op::bw_dot((float*)w_real.dptr_, (float*)temp_col.dptr_, 
@@ -192,7 +196,7 @@ class BinaryConvolutionOp : public Operator {
                                                   out.size(3))));
     }
   }
-  
+ 
   virtual void Backward(const OpContext &ctx,
                         const std::vector<TBlob> &out_grad,
                         const std::vector<TBlob> &in_data,
@@ -210,38 +214,29 @@ class BinaryConvolutionOp : public Operator {
     Tensor<xpu, 4, DType> gdata = in_grad[conv::kData].get<xpu, 4, DType>(s);
     Tensor<xpu, 1, DType> alpha = aux_args[conv::kAlpha].get<xpu, 1, DType>(s);
  
-    const size_t nbatch  = data.shape_[0];
-    const size_t input_c = data.shape_[1];
-    const size_t input_h = data.shape_[2];
-    const size_t input_w = data.shape_[3];
-    const size_t f_n = param_.num_filter;
-    const size_t f_h = param_.kernel[0];
-    const size_t f_w = param_.kernel[1];
-    const size_t out_h = grad.shape_[2];
-    const size_t out_w = grad.shape_[3];
+    const index_t nbatch  = data.shape_[0];
+    const index_t input_c = data.shape_[1];
+    const index_t input_h = data.shape_[2];
+    const index_t input_w = data.shape_[3];
+    const index_t f_n = param_.num_filter;
+    const index_t f_h = param_.kernel[0];
+    const index_t f_w = param_.kernel[1];
+    const index_t out_h = grad.shape_[2];
+    const index_t out_w = grad.shape_[3];
 
     Shape<2> w_shape = Shape2(f_n, input_c * f_h * f_w);
-    Tensor<xpu, 2, DType> w_real =
-        in_data[conv::kWeight].get_with_shape<xpu, 2, DType>(w_shape, s);
-    Tensor<xpu, 2, DType> gwmat =
-        in_grad[conv::kWeight].get_with_shape<xpu, 2, DType>(w_shape, s);
+    Tensor<xpu, 2, DType> w_real = in_data[conv::kWeight].get_with_shape<xpu, 2, DType>(w_shape, s);
+    Tensor<xpu, 2, DType> gwmat  = in_grad[conv::kWeight].get_with_shape<xpu, 2, DType>(w_shape, s);
         
     Tensor<xpu, 1, DType> workspace =
         ctx.requested[conv::kTempSpace].get_space_typed<xpu, 1, DType>(
-            Shape1(input_c * f_h * f_w * out_h * out_w + f_n * out_h * out_w + w_shape[1] * w_shape[0]), s);
+            Shape1(w_shape.Size() + this->InitTemp(data.shape_, grad.shape_)), s);
 
-    
-    Tensor<xpu, 2, DType> temp_col = Tensor<xpu, 2, DType>(workspace.dptr_, 
-            Shape2(input_c * f_h * f_w, out_h * out_w), s);
-    
-    Tensor<xpu, 2, DType> temp_dst = Tensor<xpu, 2, DType>(
-            workspace.dptr_ + temp_col.shape_.Size(),
-            Shape2(f_n, out_h * out_w), s);
-    
+    // temporary memory for binarized weight
     Tensor<xpu, 2, DType> w_bin = Tensor<xpu, 2, DType>(
-            workspace.dptr_ + temp_col.shape_.Size() + temp_dst.shape_.Size(),
-            Shape2(w_shape[0], w_shape[1]), s);
-
+            workspace.dptr_, Shape2(w_shape[0], w_shape[1]), s);
+ 
+    // compute binarized weight
     for (index_t i = 0; i < w_shape[0]; i++) {
         for (index_t j = 0; j < w_shape[1]; j++) {
             if (w_real[i][j] > 0)
@@ -253,8 +248,16 @@ class BinaryConvolutionOp : public Operator {
         }
     }
 
-    const index_t step = 1;
-    for (index_t i = 0; i < nbatch; i += 1) {
+    for (index_t i = 0; i < nbatch; i += nstep_) {
+      const index_t step = std::min(nstep_, nbatch - i);
+      // [input_c * f_h * f_w, out_h * out_w * step]
+      Tensor<xpu, 2, DType> temp_col = Tensor<xpu, 2, DType>(workspace.dptr_ + w_bin.shape_.Size(), 
+                                               Shape2(shape_colunit_[0], shape_colunit_[1] * step), s); 
+      // [f_n, out_h * out_w * step] 
+      Tensor<xpu, 2, DType> temp_dst = Tensor<xpu, 2, DType>(
+            workspace.dptr_ + w_bin.shape_.Size() + temp_col.shape_.Size(),
+                                               Shape2(shape_dstunit_[0],
+                                                      shape_dstunit_[1] * step), s); 
 
       temp_dst = reshape(swapaxis<1, 0>(grad.Slice(i, i + step)), temp_dst.shape_);
       if (param_.pad[0] == 0 && param_.pad[1] == 0) {
@@ -323,6 +326,37 @@ class BinaryConvolutionOp : public Operator {
   }
 
  private: 
+  inline index_t InitTemp(const mshadow::Shape<4> &ishape,
+                          const mshadow::Shape<4> &oshape) {
+    const int ksize_y = param_.kernel[0];
+    const int ksize_x = param_.kernel[1];
+    shape_colunit_ = mshadow::Shape2(ishape[1] * ksize_y * ksize_x,
+                                     oshape[2] * oshape[3]);
+    shape_dstunit_ = mshadow::Shape2(param_.num_filter,
+                                     oshape[2] * oshape[3]);
+    // param_.workspace is in elements of sizeof(DType)
+    // if param_.workspace is set to zero the nstep_ equals ishape[0] (batch)
+    nstep_ = std::max(
+        std::min(
+            static_cast<index_t>(
+                param_.workspace / (shape_colunit_.Size() + shape_dstunit_.Size())),
+            ishape[0]),
+        1U);
+
+    mshadow::Shape<2> scol = mshadow::Shape2(shape_colunit_[0],
+                                             shape_colunit_[1] * nstep_);
+    mshadow::Shape<2> sdst = mshadow::Shape2(shape_dstunit_[0],
+                                             shape_dstunit_[1] * nstep_);
+    index_t required_size = scol.Size() + sdst.Size();
+    CHECK_GE(param_.workspace, required_size)
+      << "\nMinimum workspace size: " << required_size * sizeof(DType) << " Bytes\n"
+      << "Given: " << param_.workspace * sizeof(DType) << " Bytes";
+    return required_size;
+  }
+  
+  mshadow::Shape<2> shape_colunit_;
+  mshadow::Shape<2> shape_dstunit_;
+  index_t nstep_;
   BinaryConvolutionParam param_;
 };  // class BinaryConvolutionOp
 

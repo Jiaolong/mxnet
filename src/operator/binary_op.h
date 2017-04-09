@@ -64,11 +64,11 @@ namespace binary_op {
                     if (i * 32 + k >= m)
                         sign = 0;
                     else
-                        sign = (a[j * m + i * 32 + k] > 0);
+                        sign = (a[j + (i * 32 + k) * n] > 0);
                     
                     val |= (sign << k);
                 }
-                b[j * mm + i] = val;
+                b[j + i * n] = val;
             }
         } // for j
     };
@@ -92,7 +92,7 @@ namespace binary_op {
             for (int p = 0; p < k; p++) {
                 out[i * k + p] = 0;
                 for (int j = 0; j < nn; j++) {
-                    out[i * k + p] += float(hacker_popcnt(WB[i * nn + j] ^ AB[j + p * nn]));
+                    out[i * k + p] += float(hacker_popcnt(WB[i * nn + j] ^ AB[j * k + p]));
                 }
                 out[i * k + p] = alpha[i] * (total_bits - 2 * out[i * k + p]);
             }
@@ -100,7 +100,7 @@ namespace binary_op {
     };
 
     /*!
-     * \brief compute dot product of binary weight and real-value data
+     * \brief compute dot product of binary weight and real-value data [row major]
      * \tparam WB pointer of the binary weight with size [m, n]
      * \tparam AB pointer of data with size [n, k]
      * \tparam m rows of W
@@ -114,8 +114,12 @@ namespace binary_op {
         for (size_t i = 0; i < m; i++) {
             for (size_t j = 0; j < k; j++) {
                 float c = 0.0;
-                for (size_t p = 0; p < n; p++)
-                    c += (W[i * n + p] > 0 ? A[p + j * n]: -1.0 * A[p + j * n]);
+                for (size_t p = 0; p < n; p++) {
+                    if (W[i * n + p] > 0)
+                        c += A[p * k + j];
+                    else if (W[i * n + p] < 0)
+                        c -= A[p * k + j];
+                }
                 
                 out[i * k + j] = c * alpha[i];
             }
